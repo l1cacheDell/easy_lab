@@ -72,18 +72,15 @@ void packing_a_4x256(double* src, double* dst) {
     // 256 = 64 x 4个数据
     for (int i = 0; i < 4; i++) {
         for (int j = 0; j < 256; j += 4) {
-            _mm256_store_pd(dst + i * 256 + j, _mm256_loadu_pd(src + i * M + j));
+            _mm256_store_pd(dst + i * 256 + j, _mm256_loadu_pd(src + i * 512 + j));
         }
     }
 }
 
-void packing_b_256x64(double* src, double* dst) {
-    for (int k = 0; k < 8; k++) {
-        // 256 x 8
-        for (int i = 0; i < 256; i++) {
-            for (int j = 0; j < 8; j += 4) {
-                _mm256_store_pd(dst + k * 256 * 8 + i * 8 + j, _mm256_loadu_pd(src + i * P + j + k * 8));
-            }
+void packing_b_256x8(double* src, double* dst) {
+    for (int i = 0; i < 256; i++) {
+        for (int j = 0; j < 8; j += 4) {
+            _mm256_store_pd(dst + i * 8 + j, _mm256_loadu_pd(src + i * 512 + j));
         }
     }
 }
@@ -94,24 +91,31 @@ void gemm_128x64_kernel(double* a, double* b, double* c, int tid)
         Split AB to 128 x 256 x 2, 256 x 64 x 2.
         Split subA to 16 x 256 x 8
         Split subA to 4 x 256 x 4, split subB to 256 x 8 x 8. */
+
+    // The a shape is: 128 x 512, the b shape is: 512 x 64
     for (int times = 0; times < 2; times++) {
+        // packing B once
+        double* b_buffer = (double*)_mm_malloc(8 * 256 * sizeof(double), 64);
+        double* a_buffer_1 = (double*)_mm_malloc(4 * 256 * sizeof(double), 64);
+        double* a_buffer_2 = (double*)_mm_malloc(4 * 256 * sizeof(double), 64);
+        double* a_buffer_3 = (double*)_mm_malloc(4 * 256 * sizeof(double), 64);
+        double* a_buffer_4 = (double*)_mm_malloc(4 * 256 * sizeof(double), 64);
         for (int blk = 0; blk < 128; blk += 16) {
             // A: 16 x 256 x 8
             // B: 256 x 64
+            int row_index = blk + 0;
+            packing_a_4x256(a + row_index * 512 + times * 256, a_buffer_1);
+            packing_a_4x256(a + (row_index + 4) * 512 + times * 256, a_buffer_2);
+            packing_a_4x256(a + (row_index + 8) * 512 + times * 256, a_buffer_3);
+            packing_a_4x256(a + (row_index + 12) * 512 + times * 256, a_buffer_4);
 
-            // packing B once
-            double* b_buffer = (double*)_mm_malloc(64 * 256 * sizeof(double), 64);
-            packing_b_256x64(b, b_buffer);
             for (int j = 0; j < 64; j += 8) {
                 // unroll 16 -> 4 x 4 manually
                 // this loop computes 4 x 4 x 256 @ 256 x 8
-                double* a_buffer = (double*)_mm_malloc(4 * 256 * sizeof(double), 64);
+                packing_b_256x8(b + times * 256 * 512 + j, b_buffer);
                 {
                     // (1) 4 x 256, packing A. 256 x 8
-                    const int row_index = blk + 0;
-                    // printf("row index: %d, times: %d, tid: %d\n", row_index, times, tid);
-                    packing_a_4x256(a + row_index * 512 + times * 256, a_buffer);
-
+                    row_index = blk + 0;
                     __m256d vec_c00 = _mm256_loadu_pd(c + row_index * 512 + j);
                     __m256d vec_c01 = _mm256_loadu_pd(c + row_index * 512 + j + 4);
                     __m256d vec_c10 = _mm256_loadu_pd(c + (row_index + 1) * 512 + j);
@@ -122,13 +126,13 @@ void gemm_128x64_kernel(double* a, double* b, double* c, int tid)
                     __m256d vec_c31 = _mm256_loadu_pd(c + (row_index + 3) * 512 + j + 4);
 
                     for (int m = 0; m < 256; m++) {
-                        __m256d vec_a0 = _mm256_broadcast_sd(a_buffer + m);
-                        __m256d vec_a1 = _mm256_broadcast_sd(a_buffer + m + 256);
-                        __m256d vec_a2 = _mm256_broadcast_sd(a_buffer + m + 256 * 2);
-                        __m256d vec_a3 = _mm256_broadcast_sd(a_buffer + m + 256 * 3);
+                        __m256d vec_a0 = _mm256_broadcast_sd(a_buffer_1 + m);
+                        __m256d vec_a1 = _mm256_broadcast_sd(a_buffer_1 + m + 256);
+                        __m256d vec_a2 = _mm256_broadcast_sd(a_buffer_1 + m + 256 * 2);
+                        __m256d vec_a3 = _mm256_broadcast_sd(a_buffer_1 + m + 256 * 3);
 
-                        __m256d vec_b0 = _mm256_load_pd(b_buffer + j * 256 + m * 8);
-                        __m256d vec_b1 = _mm256_load_pd(b_buffer + j * 256 + m * 8 + 4);
+                        __m256d vec_b0 = _mm256_load_pd(b_buffer + m * 8);
+                        __m256d vec_b1 = _mm256_load_pd(b_buffer + m * 8 + 4);
 
                         vec_c00 = _mm256_fmadd_pd(vec_a0, vec_b0, vec_c00);
                         vec_c01 = _mm256_fmadd_pd(vec_a0, vec_b1, vec_c01);
@@ -151,9 +155,8 @@ void gemm_128x64_kernel(double* a, double* b, double* c, int tid)
 
                 {
                     // (2) 4 x 256
-                    const int row_index = blk + 4;
-                    packing_a_4x256(a + row_index * 512 + times * 256, a_buffer);
-
+                    row_index = blk + 4;
+                    
                     __m256d vec_c00 = _mm256_loadu_pd(c + row_index * 512 + j);
                     __m256d vec_c01 = _mm256_loadu_pd(c + row_index * 512 + j + 4);
                     __m256d vec_c10 = _mm256_loadu_pd(c + (row_index + 1) * 512 + j);
@@ -164,13 +167,13 @@ void gemm_128x64_kernel(double* a, double* b, double* c, int tid)
                     __m256d vec_c31 = _mm256_loadu_pd(c + (row_index + 3) * 512 + j + 4);
 
                     for (int m = 0; m < 256; m++) {
-                        __m256d vec_a0 = _mm256_broadcast_sd(a_buffer + m);
-                        __m256d vec_a1 = _mm256_broadcast_sd(a_buffer + m + 256);
-                        __m256d vec_a2 = _mm256_broadcast_sd(a_buffer + m + 256 * 2);
-                        __m256d vec_a3 = _mm256_broadcast_sd(a_buffer + m + 256 * 3);
+                        __m256d vec_a0 = _mm256_broadcast_sd(a_buffer_2 + m);
+                        __m256d vec_a1 = _mm256_broadcast_sd(a_buffer_2 + m + 256);
+                        __m256d vec_a2 = _mm256_broadcast_sd(a_buffer_2 + m + 256 * 2);
+                        __m256d vec_a3 = _mm256_broadcast_sd(a_buffer_2 + m + 256 * 3);
 
-                        __m256d vec_b0 = _mm256_load_pd(b_buffer + j * 256 + m * 8);
-                        __m256d vec_b1 = _mm256_load_pd(b_buffer + j * 256 + m * 8 + 4);
+                        __m256d vec_b0 = _mm256_load_pd(b_buffer + m * 8);
+                        __m256d vec_b1 = _mm256_load_pd(b_buffer + m * 8 + 4);
 
                         vec_c00 = _mm256_fmadd_pd(vec_a0, vec_b0, vec_c00);
                         vec_c01 = _mm256_fmadd_pd(vec_a0, vec_b1, vec_c01);
@@ -193,8 +196,7 @@ void gemm_128x64_kernel(double* a, double* b, double* c, int tid)
 
                 {
                     // (3) 4 x 256
-                    const int row_index = blk + 8;
-                    packing_a_4x256(a + row_index * 512 + times * 256, a_buffer);
+                    row_index = blk + 8;
 
                     __m256d vec_c00 = _mm256_loadu_pd(c + row_index * 512 + j);
                     __m256d vec_c01 = _mm256_loadu_pd(c + row_index * 512 + j + 4);
@@ -206,13 +208,13 @@ void gemm_128x64_kernel(double* a, double* b, double* c, int tid)
                     __m256d vec_c31 = _mm256_loadu_pd(c + (row_index + 3) * 512 + j + 4);
 
                     for (int m = 0; m < 256; m++) {
-                        __m256d vec_a0 = _mm256_broadcast_sd(a_buffer + m);
-                        __m256d vec_a1 = _mm256_broadcast_sd(a_buffer + m + 256);
-                        __m256d vec_a2 = _mm256_broadcast_sd(a_buffer + m + 256 * 2);
-                        __m256d vec_a3 = _mm256_broadcast_sd(a_buffer + m + 256 * 3);
+                        __m256d vec_a0 = _mm256_broadcast_sd(a_buffer_3 + m);
+                        __m256d vec_a1 = _mm256_broadcast_sd(a_buffer_3 + m + 256);
+                        __m256d vec_a2 = _mm256_broadcast_sd(a_buffer_3 + m + 256 * 2);
+                        __m256d vec_a3 = _mm256_broadcast_sd(a_buffer_3 + m + 256 * 3);
 
-                        __m256d vec_b0 = _mm256_load_pd(b_buffer + j * 256 + m * 8);
-                        __m256d vec_b1 = _mm256_load_pd(b_buffer + j * 256 + m * 8 + 4);
+                        __m256d vec_b0 = _mm256_load_pd(b_buffer + m * 8);
+                        __m256d vec_b1 = _mm256_load_pd(b_buffer + m * 8 + 4);
 
                         vec_c00 = _mm256_fmadd_pd(vec_a0, vec_b0, vec_c00);
                         vec_c01 = _mm256_fmadd_pd(vec_a0, vec_b1, vec_c01);
@@ -235,8 +237,7 @@ void gemm_128x64_kernel(double* a, double* b, double* c, int tid)
 
                 {
                     // (4) 4 x 256
-                    const int row_index = blk + 12;
-                    packing_a_4x256(a + row_index * 512 + times * 256, a_buffer);
+                    row_index = blk + 12;
 
                     __m256d vec_c00 = _mm256_loadu_pd(c + row_index * 512 + j);
                     __m256d vec_c01 = _mm256_loadu_pd(c + row_index * 512 + j + 4);
@@ -248,13 +249,13 @@ void gemm_128x64_kernel(double* a, double* b, double* c, int tid)
                     __m256d vec_c31 = _mm256_loadu_pd(c + (row_index + 3) * 512 + j + 4);
 
                     for (int m = 0; m < 256; m++) {
-                        __m256d vec_a0 = _mm256_broadcast_sd(a_buffer + m);
-                        __m256d vec_a1 = _mm256_broadcast_sd(a_buffer + m + 256);
-                        __m256d vec_a2 = _mm256_broadcast_sd(a_buffer + m + 256 * 2);
-                        __m256d vec_a3 = _mm256_broadcast_sd(a_buffer + m + 256 * 3);
+                        __m256d vec_a0 = _mm256_broadcast_sd(a_buffer_4 + m);
+                        __m256d vec_a1 = _mm256_broadcast_sd(a_buffer_4 + m + 256);
+                        __m256d vec_a2 = _mm256_broadcast_sd(a_buffer_4 + m + 256 * 2);
+                        __m256d vec_a3 = _mm256_broadcast_sd(a_buffer_4 + m + 256 * 3);
 
-                        __m256d vec_b0 = _mm256_load_pd(b_buffer + j * 256 + m * 8);
-                        __m256d vec_b1 = _mm256_load_pd(b_buffer + j * 256 + m * 8 + 4);
+                        __m256d vec_b0 = _mm256_load_pd(b_buffer + m * 8);
+                        __m256d vec_b1 = _mm256_load_pd(b_buffer + m * 8 + 4);
 
                         vec_c00 = _mm256_fmadd_pd(vec_a0, vec_b0, vec_c00);
                         vec_c01 = _mm256_fmadd_pd(vec_a0, vec_b1, vec_c01);
@@ -274,10 +275,14 @@ void gemm_128x64_kernel(double* a, double* b, double* c, int tid)
                     _mm256_storeu_pd(c + (row_index + 3) * 512 + j, vec_c30);
                     _mm256_storeu_pd(c + (row_index + 3) * 512 + j + 4, vec_c31);
                 }
-                _mm_free(a_buffer);
+                
             }
-            _mm_free(b_buffer);
         }
+        _mm_free(a_buffer_1);
+        _mm_free(a_buffer_2);
+        _mm_free(a_buffer_3);
+        _mm_free(a_buffer_4);
+        _mm_free(b_buffer);
     }
 }
 
