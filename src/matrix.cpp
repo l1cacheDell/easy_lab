@@ -1,4 +1,5 @@
 #include "matrix.h"
+#include <stdio.h>
 
 void random_init_matrix(double *matrix, int n, int m)
 {
@@ -25,6 +26,7 @@ bool judge_right(double *pointer1, double *pointer2, int n, int m)
         num1 = *pointer1;
         num2 = *pointer2;
         if(std::abs(num1 - num2) > gap) {
+            printf("The idx: %d\n", index);
             return false;
         }
     }
